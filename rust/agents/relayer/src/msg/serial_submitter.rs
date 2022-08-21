@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use tracing::debug;
 use tracing::instrument;
 use tracing::{info, info_span, instrument::Instrumented, Instrument};
+use ethers::prelude::*;
 
 use super::SubmitMessageArgs;
 
@@ -188,7 +189,66 @@ impl SerialSubmitter {
         for msg in self.wait_queue.drain(..).rev() {
             // TODO(webbhorn): Check against interchain gas paymaster.  If now enough payment,
             // promote to run queue.
-            self.run_queue.push_front(msg);
+            let total_gas_payment_wei = self.db.retrieve_gas_payment_for_leaf(msg.leaf_index);
+            let base: i128 = 10;
+            let total_gas_payment = total_gas_payment_wei / base.pow(18);
+            // need to get chain ID here to understand what this total gas is worth
+            let chain_id_origin = msg.message.origin;
+            let chain_id_destination = msg.message.destination;
+            // will need to query an API to convert currencies
+            // in the future we will just do this part once somewhere else instead of calling the api for every msg, this is just for testing
+            const COINGECKO_KEY: String = String::from("example-api-key");
+            // add all supported chains here, see https://www.coingecko.com/en/api/documentation
+            let Sip44ToCoingeckoId: Vec<(u32, String)> = vec![(1, String::from("ethereum")), (10, String::from("optimism"))];
+
+            let mut current_chain_origin_coingeckoid: String = String::from("");
+            let mut current_chain_destination_coingeckoid: String = String::from("");
+
+            for &(a,b) in Sip44ToCoingeckoId.iter() {
+                if a == chain_id_origin {
+                    current_chain_origin_coingeckoid = &b;
+                }
+                if a == chain_id_destination {
+                    current_chain_destination_coingeckoid = &b;
+                }
+            }
+            let client = reqwest::Client::new();
+            let url_origin = format!("{}{}{}{}", String::from("https://api.coingecko.com/api/v3/simple/price?ids="), current_chain_origin_coingeckoid, String::from("&vs_currencies=usd&key="), COINGECKO_KEY); 
+            
+            let res_origin = client.get(url_origin)
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+
+            let url_destination= format!("{}{}{}{}", String::from("https://api.coingecko.com/api/v3/simple/price?ids="), current_chain_destination_coingeckoid, String::from("&vs_currencies=usd&key="), COINGECKO_KEY); 
+            
+            let res_destination = client.get(url_destination)
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+            /*
+            // response format
+                {
+                  "ethereum": {
+                    "usd": 1592.32
+                  }
+                }
+            */
+
+            let total_usd_value_paid = total_gas_payment * res_origin[current_chain_origin_coingeckoid]["usd"];
+
+            // need to estimate gas costs for process
+            // process uses 156,543 gas (see https://etherscan.io/address/0xF7af65596A16740b16CF755F3A43206C96285da0#events)
+
+            let provider = Provider::<Http>::try_from("https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27").unwrap();
+            let gas_price = provider.get_gas_price().await?;
+
+            let total_estimate_spend = (gas_price * 156543 / base.pow(18)) * res_destination[current_chain_destination_coingeckoid]["usd"];
+
+            // estimated 5% fee, can be adjusted in the settings later
+            if total_usd_value_paid * 1.05 > total_estimate_spend {
+                self.run_queue.push_front(msg);
+            }
         }
 
         self.metrics
